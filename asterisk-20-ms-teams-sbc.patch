@@ -1,0 +1,116 @@
+--- a/include/asterisk/res_pjsip.h
++++ b/include/asterisk/res_pjsip.h
+@@ -235,6 +235,8 @@ struct ast_sip_transport {
+ 		AST_STRING_FIELD(external_media_address);
+ 		/*! Optional domain to use for messages if provided could not be found */
+ 		AST_STRING_FIELD(domain);
++		/*! MS Teams signaling hostname */
++		AST_STRING_FIELD(ms_signaling_address);
+ 		);
+ 	/*! Type of transport */
+ 	enum ast_transport type;
+--- a/res/res_pjsip/config_transport.c
++++ b/res/res_pjsip/config_transport.c
+@@ -1105,6 +1105,28 @@ static int privkey_file_to_str(const void *obj, const intptr_t *args, char **bu
+ 	return 0;
+ }
+ 
++/*! Custom handler for ms_signaling_address */
++static int transport_ms_signaling_address_handler(const struct aco_option *opt, struct ast_variable *var, void *obj)
++{
++	struct ast_sip_transport *transport = obj;
++	RAII_VAR(struct ast_sip_transport_state *, state, find_or_create_temporary_state(transport), ao2_cleanup);
++
++	if (!state) {
++		return -1;
++	}
++
++	if (ast_strlen_zero(var->value)) {
++		return 0;
++	}
++
++	ast_string_field_set(transport, ms_signaling_address, var->value);
++	return 0;
++}
++
++static int transport_ms_signaling_address_to_str(const void *obj, const intptr_t *args, char **buf)
++{
++	const struct ast_sip_transport *transport = obj;
++	*buf = ast_strdup(transport->ms_signaling_address);
++	return 0;
++}
++
+ /*! \brief Custom handler for turning a string protocol into an enum */
+ static int transport_protocol_handler(const struct aco_option *opt, struct ast_variable *var, void *obj)
+ {
+@@ -1831,6 +1853,7 @@ int ast_sip_initialize_sorcery_transport(void)
+ 	ast_sorcery_object_field_register(sorcery, "transport", "external_signaling_port", "0", OPT_UINT_T, PARSE_IN_RANGE, FLDSET(struct ast_sip_transport, external_signaling_port), 0, 65535);
+ 	ast_sorcery_object_field_register(sorcery, "transport", "external_media_address", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, external_media_address));
+ 	ast_sorcery_object_field_register(sorcery, "transport", "domain", "", OPT_STRINGFIELD_T, 0, STRFLDSET(struct ast_sip_transport, domain));
++	ast_sorcery_object_field_register_custom(sorcery, "transport", "ms_signaling_address", "", transport_ms_signaling_address_handler, transport_ms_signaling_address_to_str, NULL, 0, 0);
+ 	ast_sorcery_object_field_register_custom(sorcery, "transport", "verify_server", "", transport_tls_bool_handler, verify_server_to_str, NULL, 0, 0);
+ 	ast_sorcery_object_field_register_custom(sorcery, "transport", "verify_client", "", transport_tls_bool_handler, verify_client_to_str, NULL, 0, 0);
+ 	ast_sorcery_object_field_register_custom(sorcery, "transport", "require_client_cert", "", transport_tls_bool_handler, require_client_cert_to_str, NULL, 0, 0);
+--- a/res/res_pjsip_nat.c
++++ b/res/res_pjsip_nat.c
+@@ -32,6 +32,7 @@
+ #include "asterisk/res_pjsip.h"
+ #include "asterisk/res_pjsip_session.h"
+ #include "asterisk/module.h"
+ #include "asterisk/acl.h"
++#include "asterisk/strings.h"
+ 
+ /*! URI parameter for original host/port */
+ #define AST_SIP_X_AST_ORIG_HOST "x-ast-orig-host"
+@@ -370,7 +371,12 @@ static void nat_rewrite_contact_via(pjsip_tx_data *tdata, struct ast_sip_trans
+ 			tdata->msg->line.status.code != PJSIP_SC_MOVED_TEMPORARILY )) {
+ 			/* We can only rewrite the URI when one is present */
+ 			if (uri || (uri = ast_sip_get_contact_sip_uri(tdata))) {
+-				pj_strdup2(tdata->pool, &uri->host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
++				if (!ast_strlen_zero(transport->ms_signaling_address)) {
++					pj_strdup2(tdata->pool, &uri->host, transport->ms_signaling_address);
++				} else {
++					pj_strdup2(tdata->pool, &uri->host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
++				}
+ 				if (transport->external_signaling_port) {
+ 					uri->port = transport->external_signaling_port;
+ 					ast_debug(4, "Re-wrote Contact URI port to %d\n", uri->port);
+@@ -380,7 +386,12 @@ static void nat_rewrite_contact_via(pjsip_tx_data *tdata, struct ast_sip_trans
+ 
+ 		/* Update the via header if relevant */
+ 		if ((tdata->msg->type == PJSIP_REQUEST_MSG) && (via || (via = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_VIA, NULL)))) {
+-			pj_strdup2(tdata->pool, &via->sent_by.host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
++			if (!ast_strlen_zero(transport->ms_signaling_address)) {
++				pj_strdup2(tdata->pool, &via->sent_by.host, transport->ms_signaling_address);
++			} else {
++				pj_strdup2(tdata->pool, &via->sent_by.host, ast_sockaddr_stringify_host(&transport_state->external_signaling_address));
++			}
+ 			if (transport->external_signaling_port) {
+ 				via->sent_by.port = transport->external_signaling_port;
+ 			}
+--- a/res/res_pjsip/pjsip_config.xml
++++ b/res/res_pjsip/pjsip_config.xml
+@@ -2381,6 +2381,9 @@
+ 					<synopsis>External address for SIP signalling</synopsis>
+ 				</configOption>
+ 				<configOption name="ms_signaling_address">
++					<synopsis>MS Teams signaling hostname</synopsis>
++				</configOption>
++				<configOption name="external_signaling_port" default="0">
+ 					<since>
+ 						<version>12.0.0</version>
+ 					</since>
+ 					<synopsis>External port for SIP signalling</synopsis>
+--- a/res/res_pjsip/pjsip_manager.xml
++++ b/res/res_pjsip/pjsip_manager.xml
+@@ -220,6 +220,9 @@
+ 				<parameter name="ExternalSignalingAddress">
+ 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='external_signaling_address']/synopsis/node())"/></para>
+ 				</parameter>
++				<parameter name="MSTeamSignalingAddress">
++					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='res_pjsip']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='ms_signaling_address']/synopsis/node())"/></para>
++				</parameter>
+ 				<parameter name="ExternalSignalingPort">
+ 					<para><xi:include xpointer="xpointer(/docs/configInfo[@name='pjsip.conf']/configFile[@name='pjsip.conf']/configObject[@name='transport']/configOption[@name='external_signaling_port']/synopsis/node())"/></para>
+ 				</parameter>
+
